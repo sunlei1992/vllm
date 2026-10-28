@@ -154,6 +154,9 @@ class SimulationConfig:
         from vllm.v1.worker.simulated import kv_nixl
 
         connector = kv_transfer.kv_connector
+        if connector == "SimulatedAscendStoreConnector":
+            # LOCAL EXPERIMENT: in-memory AscendStore stand-in.
+            return
         if connector == "OffloadingConnector":
             spec = OffloadingSpecFactory.get_spec_cls(
                 kv_transfer.kv_connector_extra_config

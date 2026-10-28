@@ -345,6 +345,60 @@ class SimulatedOffloadingWorker(OffloadingWorker):
         return min(ends, default=None)
 
 
+class _NoTransfers:
+    """No worker-side transfers: the connector itself is a no-op."""
+
+    def next_completion(self) -> float | None:
+        return None
+
+
+class SimulatedStoreWorker:
+    """Timed loads/stores for the in-memory AscendStore connector.
+
+    The connector reports how many bytes it would move; this class books the
+    transfer on the simulated clock, so a request waits for the modelled time.
+    """
+
+    def __init__(self, clock: Clock, load: TransferRate, store: TransferRate | None):
+        self.clock = clock
+        self.rates = (load, store)
+        self._jobs: list[tuple[float, int, str]] = []
+        self._free_at = [0.0, 0.0]
+
+    def _submit(self, req_id: str, direction: int, num_bytes: int) -> None:
+        rate = self.rates[direction]
+        if rate is None or num_bytes <= 0:
+            return
+        start = max(self.clock.now(), self._free_at[direction])
+        end = start + rate.seconds(num_bytes)
+        self._free_at[direction] = end
+        self._jobs.append((end, direction, req_id))
+
+    def submit_load(self, req_id: str, num_bytes: int) -> None:
+        self._submit(req_id, _LOAD, num_bytes)
+
+    def submit_store(self, req_id: str, num_bytes: int) -> None:
+        self._submit(req_id, _STORE, num_bytes)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        now = self.clock.now()
+        sending: set[str] = set()
+        recving: set[str] = set()
+        pending = []
+        for end, direction, req_id in self._jobs:
+            if end > now:
+                pending.append((end, direction, req_id))
+            elif direction == _STORE:
+                sending.add(req_id)
+            else:
+                recving.add(req_id)
+        self._jobs = pending
+        return sending, recving
+
+    def next_completion(self) -> float | None:
+        return min((job[0] for job in self._jobs), default=None)
+
+
 class SimulatedTransfers(Protocol):
     def next_completion(self) -> float | None:
         """When the next in-flight transfer completes, if any."""
@@ -403,6 +457,10 @@ def simulated_kv_connector(
             ],
             device_free_at=device_free_at,
         )
+    elif type(connector).__name__ == "SimulatedAscendStoreConnector":
+        # LOCAL EXPERIMENT: scheduler-side lookup + modelled transfer time.
+        transfers = SimulatedStoreWorker(clock, load, store)
+        connector.simulated_transfers = transfers
     elif isinstance(connector, NixlConnector | NixlPushConnector):
         assert isinstance(connector.connector_worker, SimulatedNixlWorker)
         transfers = connector.connector_worker
