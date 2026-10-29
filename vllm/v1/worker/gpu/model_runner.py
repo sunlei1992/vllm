@@ -741,6 +741,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
+        self.initialize_kv_cache_tensors(
+            is_profiling=is_profiling,
+            kv_cache_allocation_context=kv_cache_allocation_context,
+        )
+
+    def initialize_kv_cache_tensors(
+        self,
+        *,
+        is_profiling: bool,
+        kv_cache_allocation_context: AbstractContextManager | None,
+    ) -> None:
         # Capture warmup providers that depend on allocated KV-cache strides.
         with self.jit_warmup_registry.activate():
             kv_caches_dict = init_kv_cache(
@@ -758,7 +769,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
-            self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            self.kv_connector = self._make_kv_connector(kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1107,6 +1118,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
+    def _make_kv_connector(
+        self, kv_caches_dict: dict[str, torch.Tensor]
+    ) -> KVConnector:
+        return get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def _update_request_states(self, scheduler_output: SchedulerOutput) -> None:
+        self.finish_requests(scheduler_output)
+        self.free_states(scheduler_output)
+        self.add_requests(scheduler_output)
+        self.update_requests(scheduler_output)
+        self.block_tables.apply_staged_writes()
+
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
@@ -1199,6 +1222,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=self.req_states.num_computed_prefill_tokens,
         )
 
+        self._apply_kv_cache_memory_updates(scheduler_output)
+
+    def _apply_kv_cache_memory_updates(self, scheduler_output: SchedulerOutput) -> None:
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
@@ -1641,11 +1667,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
+            self._update_request_states(scheduler_output)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
